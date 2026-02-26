@@ -38,6 +38,8 @@ from notebooks.vcode_codec import (
 )
 import re
 
+from utils.attr_rules import load_match_table_csv, compile_rules, apply_rules_to_attrs
+
 def _auto_fill_nominal(attrs: dict) -> dict:
     if not attrs:
         return attrs
@@ -143,31 +145,32 @@ def _extract_spec_common(bundle):
 
 def _merged_lookup_options(lookups: dict, table: str, system: str, ptype_raw: str) -> dict:
     """
-    반환: {code: label}, 우선순위 = 정확 > 그룹 > 공통(*)
+    반환: {code: label}
+    정책(중요):
+      - 정확키에 값이 하나라도 있으면: 정확키만 반환 (공통(*) 섞지 않음)
+      - 정확키가 비면: 그룹키만 반환 (공통(*) 섞지 않음)
+      - 둘 다 비면: 공통(*)만 반환
     """
     bundle = lookups.get(table)
-    if bundle is None:
+    if not bundle:
         return {}
 
-    spec, common = _extract_spec_common(bundle)
+    # loaders.py 포맷: {"spec": {(pt,code):label}, "common":{code:label}, ...}
+    spec = bundle.get("spec", {}) if isinstance(bundle, dict) else {}
+    common = bundle.get("common", {}) if isinstance(bundle, dict) else {}
 
-    out: dict[str, str] = {}
-    # 1) 정확/그룹 순회 (먼저 들어온 게 우선)
+    # 1) 정확키/그룹키 중 "처음 발견되는" 쪽만 사용
     for key in _candidate_keys(system, ptype_raw):
-        for (pt, code), label in spec.items() if spec and next(iter(spec.keys()), (None, None)) and isinstance(next(iter(spec.keys())), tuple) else []:
-            if pt == key and str(code) not in out:
+        out = {}
+        # spec이 (pt,code)->label
+        for (pt, code), label in spec.items():
+            if str(pt).upper().strip() == str(key).upper().strip():
                 out[str(code)] = str(label)
-        # spec이 (pt,code)->label 평탄화가 아닌, {pt:{code:label}} 구조일 수도 있어 보강
-        if spec and isinstance(next(iter(spec.values())), dict):
-            inner = spec.get(key, {})
-            for code, label in inner.items():
-                out.setdefault(str(code), str(label))
+        if out:
+            return out  # ★ 공통은 섞지 않는다
 
-    # 2) 공통(*) 추가
-    for code, label in common.items():
-        out.setdefault(str(code), str(label))
-
-    return out
+    # 2) spec에 아무것도 없으면 공통만
+    return {str(code): str(label) for code, label in common.items()}
 
 # ---------------------------------------------------------------------
 # 기본 페이지 설정 (wide + 제목/아이콘)
@@ -480,9 +483,15 @@ ok_pt = (paired_pt or "") if sel_pt.startswith("V") else sel_pt
 udf = load_union_schema()
 pair_id = f"{ik_pt}_{ok_pt}" if has_both else None
 
-
 if pair_id and udf[udf["pair_id"] == pair_id].empty:
     st.warning(f"union_schema에 pair_id '{pair_id}' 행이 없습니다. (빌더 최신화 확인)")
+
+@st.cache_resource(show_spinner=False)
+def _load_compiled_attr_rules():
+    df_rules = load_match_table_csv("data/매칭테이블.csv")
+    return compile_rules(df_rules)
+
+ATTR_RULES = _load_compiled_attr_rules()
 
 # ---------------------------------------------------------------------
 # 4) 입력 기준 선택
@@ -732,6 +741,9 @@ def get_required_sets(udf, pair_id: str, base_side: str):
         need_extra = [k for k in need_extra if k not in nominal_family]
 
     return need_base, need_extra
+
+if ok_pt == "2258":
+    st.info("참고: 옥천 2258은 11번째 자리(재료종류)에 따라 익산 품번이 달라질 수 있습니다. (예: 2→V130, 4→V132, 6→V134) 필요 시 익산 품번을 확인 후 진행해 주세요.")
 # ---------------------------------------------------------------------
 # 6 + 7) 좌/우 패널 렌더 + 조회/생성 (Enter 지원 위해 하나의 form으로 통합)
 # ---------------------------------------------------------------------
@@ -819,6 +831,79 @@ if do_query:
 
         # ★ 호칭 자동 보완
         attrs = _auto_fill_nominal(attrs)
+        # ✅ 0) 속성간 매칭 룰 적용 (FIX/ALLOWLIST/자동매칭/충돌)
+        rule_result = apply_rules_to_attrs(
+            udf=udf,
+            compiled=ATTR_RULES,
+            pair_id=pair_id,
+            base_side=base_side,     # "IK" 또는 "OK"
+            attrs_in=attrs,
+        )
+        
+        # 자동 세팅된 값은 다음 rerun에서 UI에도 반영되도록 session_state에 기록
+        for wk, val in rule_result.updates.items():
+            st.session_state[wk] = val
+        
+        # 참고 메시지 출력
+        for msg in rule_result.infos:
+            st.info(msg)
+        
+        # 차단(에러) 있으면 조회 중단
+        if rule_result.blockers:
+            for e in rule_result.blockers:
+                st.error(e)
+            st.stop()
+        
+        # 충돌이 있으면 사용자 선택 UI 띄우고, 선택 적용 후 rerun
+        if rule_result.conflicts:
+            st.warning("속성 자동매칭 중 충돌이 발견되었습니다. 아래에서 후보를 선택해 주세요.")
+        
+            # 룩업 라벨을 보여주기 위해 lookups 로드
+            lookups = load_lookups()
+        
+            # conflict 선택값을 저장할 임시 딕셔너리
+            chosen = {}
+        
+            for i, c in enumerate(rule_result.conflicts, start=1):
+                # side별 part_type
+                pt_for_lookup = ik_pt if c.side == "IK" else ok_pt
+                system_local = "IK" if str(pt_for_lookup).upper().startswith("V") else "OK"
+        
+                # 옵션(코드→라벨) 가져오기
+                opts = _merged_lookup_options(lookups, c.lookup, system_local, pt_for_lookup)
+        
+                # 후보 코드 리스트
+                codes = c.candidates
+        
+                # 표시 라벨
+                side_kor = "익산" if c.side == "IK" else "옥천"
+                kor_label = get_attr_label_kor(c.side, pt_for_lookup, c.key)
+        
+                # 기본값: 현재 세션 값이 후보에 있으면 그걸, 아니면 첫 후보
+                current = st.session_state.get(f"U:{pair_id}:{c.side}:{c.key}", "")
+                default = current if current in codes else codes[0]
+        
+                chosen_code = st.selectbox(
+                    f"{i}) {side_kor} / {kor_label} ({c.lookup}) — {c.reason}",
+                    codes,
+                    index=codes.index(default) if default in codes else 0,
+                    format_func=lambda code: f"{code} - {opts.get(code,'')}" if opts else code,
+                    key=f"CF:{pair_id}:{c.side}:{c.key}:{c.lookup}:{i}",
+                )
+                chosen[(c.side, c.key)] = chosen_code
+        
+            if st.button("선택 적용", type="primary"):
+                # 선택값을 실제 입력 위젯키(U:...)에 반영
+                for (side, key), code in chosen.items():
+                    wk = f"U:{pair_id}:{side}:{key}"
+                    st.session_state[wk] = code
+                st.success("선택값을 적용했습니다. 이제 '조회'를 다시 눌러 주세요.")
+                st.rerun()
+        
+            st.stop()
+        
+        # 충돌 없으면 attrs 갱신해서 아래 로직 계속 진행
+        attrs = rule_result.attrs
 
         # 필수 누락 체크
         miss_base  = missing_required_keys(udf, pair_id, base_side,  attrs)
