@@ -918,7 +918,11 @@ if do_query:
                 f"상대({other_side}) 필수 누락: {miss_other} — 이 키들까지 입력하면 완전한 11자리 생성"
             )
 
-        ik_code, ok_code = encode_both(udf, pair_id, attrs)
+        ik_code, ok_code = encode_both(
+            udf, pair_id, attrs,
+            ik_overrides=rule_result.ik_overrides,
+            ok_overrides=rule_result.ok_overrides,
+        )
 
         if ik_code:
             st.success(f"IK 코드: `{ik_code}`")
