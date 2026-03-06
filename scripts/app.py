@@ -38,7 +38,31 @@ from notebooks.vcode_codec import (
 )
 import re
 
-from utils.attr_rules import load_match_table_csv, compile_rules, apply_rules_to_attrs
+from utils.attr_rules import load_match_table_csv, compile_rules, apply_rules_to_attrs, build_schema_maps
+
+# -------------------------------------------------------------------
+# (핵심) pending do_query 복원은 widget_updates와 무관하게 항상 처리해야 함
+# - shared lookup conflict는 overrides만 바뀌고 widget_updates는 없을 수 있음
+# -------------------------------------------------------------------
+if st.session_state.pop("__pending_do_query__", False):
+    st.session_state["__do_query__"] = True
+if "__pending_widget_updates__" in st.session_state:
+    upd = st.session_state.pop("__pending_widget_updates__", {})
+    for k, v in upd.items():
+        st.session_state[k] = v  # ✅ 이 시점은 위젯 instantiate 전이라 안전
+
+    # ✅ (추가) pending으로 넘어온 "조회 의도"가 있으면 다음 run에서 강제 복원
+    if st.session_state.pop("__pending_do_query__", False):
+        st.session_state["__do_query__"] = True
+
+    # 부가 상태들도 꺼내서 유지(원하면)
+    st.session_state["__infos__"] = st.session_state.pop("__pending_infos__", [])
+    st.session_state["__blockers__"] = st.session_state.pop("__pending_blockers__", [])
+    st.session_state["__conflicts__"] = st.session_state.pop("__pending_conflicts__", [])
+    
+    # ✅ 수정(키가 있을 때만 반영)
+    st.session_state["__run_ik_overrides__"] = st.session_state.pop("__pending_ik_overrides__", {})
+    st.session_state["__run_ok_overrides__"] = st.session_state.pop("__pending_ok_overrides__", {})
 
 def _auto_fill_nominal(attrs: dict) -> dict:
     if not attrs:
@@ -177,6 +201,35 @@ def _merged_lookup_options(lookups: dict, table: str, system: str, ptype_raw: st
 # ---------------------------------------------------------------------
 st.set_page_config(page_title="Standard Parts Finder", page_icon="🔎", layout="wide")
 st.title("Standard Parts Finder")
+
+if "__await_conflict__" not in st.session_state:
+    st.session_state["__await_conflict__"] = False
+if "__active_conflicts__" not in st.session_state:
+    st.session_state["__active_conflicts__"] = []
+if "__conflict_pair_id__" not in st.session_state:
+    st.session_state["__conflict_pair_id__"] = None
+if "__conflict_base_side__" not in st.session_state:
+    st.session_state["__conflict_base_side__"] = None
+
+# (변경) 이번 조회(run)에서만 쓰는 overrides (저장/누적 금지)
+if "__run_ik_overrides__" not in st.session_state:
+    st.session_state["__run_ik_overrides__"] = {}
+if "__run_ok_overrides__" not in st.session_state:
+    st.session_state["__run_ok_overrides__"] = {}
+
+# ---------------------------------------------------------------------
+# (추가) 마지막 "성공" 코드 결과 저장소
+# - 충돌/에러 run에서는 코드가 절대 보이지 않게 하려고 session_state에 따로 보관
+# ---------------------------------------------------------------------
+if "__last_codes__" not in st.session_state:
+    st.session_state["__last_codes__"] = {"pair_id": None, "ik": None, "ok": None}
+# ---------------------------------------------------------------------
+# (추가) 충돌 해결값 저장소
+# - 사용자가 한 번 선택한 충돌은 다음 조회부터 다시 묻지 않기 위해 저장
+# - key: (pair_id, side, attr_key, lookup) -> chosen_code
+# ---------------------------------------------------------------------
+if "__conflict_resolutions__" not in st.session_state:
+    st.session_state["__conflict_resolutions__"] = {}
 
 # ---------------------------------------------------------------------
 # 0) 공통 유틸
@@ -493,6 +546,62 @@ def _load_compiled_attr_rules():
 
 ATTR_RULES = _load_compiled_attr_rules()
 
+def auto_target_keys_from_rules(udf: pd.DataFrame, pair_id: str, base_side: str, compiled_rules: dict) -> set[str]:
+    base_side = (base_side or "").upper().strip()
+    direction = "익산->옥천" if base_side == "IK" else "옥천->익산"
+    other_side = "OK" if base_side == "IK" else "IK"
+
+    smap = build_schema_maps_all(udf, pair_id)
+    IK_L2K = smap.get("IK_lookup_to_key", {}) or {}
+    OK_L2K = smap.get("OK_lookup_to_key", {}) or {}
+
+    def l2k(side: str, lookup: str) -> str | None:
+        return IK_L2K.get(lookup) if side == "IK" else OK_L2K.get(lookup)
+
+    maps_for_pair = compiled_rules.get("maps", {}).get(direction, {}).get(pair_id, {})
+    if not maps_for_pair:
+        return set()
+
+    auto_keys: set[str] = set()
+    for (_trig_lk, _trig_cd), actions in maps_for_pair.items():
+        for (tgt_lk, _tgt_cd) in actions:
+            tgt_key = l2k(other_side, str(tgt_lk).strip())
+            if tgt_key:
+                auto_keys.add(str(tgt_key).strip())
+
+    return auto_keys
+
+def build_schema_maps_all(udf: pd.DataFrame, pair_id: str) -> dict:
+    """
+    union_schema의 pair_id 블록에서 required 여부와 관계 없이
+    lookup -> key 매핑을 만든다. (extra 키도 잡히게)
+    """
+    block = udf[udf["pair_id"] == pair_id].copy()
+    if block.empty:
+        return {"IK_lookup_to_key": {}, "OK_lookup_to_key": {}}
+
+    for c in ("lookup", "key", "ik_slot", "ok_slot"):
+        if c in block.columns:
+            block[c] = block[c].fillna("").astype(str).str.strip()
+
+    ik_l2k, ok_l2k = {}, {}
+
+    for _, r in block.iterrows():
+        lk = r.get("lookup", "")
+        k  = r.get("key", "")
+        if not lk or not k:
+            continue
+
+        # IK쪽 속성이 존재하는 행(ik_slot이 있거나 required_ik든 뭐든 "IK에 속함"이면)
+        if str(r.get("ik_slot", "")).strip():
+            ik_l2k.setdefault(lk, k)
+
+        # OK쪽 속성이 존재하는 행
+        if str(r.get("ok_slot", "")).strip():
+            ok_l2k.setdefault(lk, k)
+
+    return {"IK_lookup_to_key": ik_l2k, "OK_lookup_to_key": ok_l2k}
+
 # ---------------------------------------------------------------------
 # 4) 입력 기준 선택
 # ---------------------------------------------------------------------
@@ -610,7 +719,10 @@ def _render_inputs_for_side(
 
         # key는 그대로 영문 attr_name을 사용 (내부 로직 및 세션 키 안정성 유지)
         key = f"U:{pair_id}:{side}:{k}"
-
+        
+        # ✅ 이번 run에서 실제로 렌더링되는 위젯 키 기록
+        st.session_state["__visible_widget_keys__"].add(key)
+        
         # ★ 0으로 한다(00, 000…) 자동 채움: attr_name == "0"
         if str(k) == "0":
             # 자릿수만큼 0 채우기 (slot 기반)
@@ -627,6 +739,20 @@ def _render_inputs_for_side(
             opts = _merged_lookup_options(lookups, lookup, system_local, pt_for_lookup)  # {code: label}
             if opts:
                 codes = list(opts.keys())
+                # ✅ 기준측이면, 매칭테이블(룰)에 존재하는 trigger 코드만 남긴다
+                try:
+                    # side가 기준측일 때만 제한
+                    if pair_id and (side.upper() == base_side.upper()):
+                        direction = "익산->옥천" if base_side.upper() == "IK" else "옥천->익산"
+                        trig_map = ATTR_RULES.get("trigger_codes", {}).get(direction, {}).get(pair_id, {})
+                        allow = trig_map.get(lookup, None)
+                
+                        # trigger_codes가 있으면 그걸 최우선으로 사용 (v130이면 material에서 2/6만 남음)
+                        if allow:
+                            allow = set([str(x).strip() for x in allow])
+                            codes = [c for c in codes if str(c).strip() in allow]
+                except Exception:
+                    pass
                 # ★ 변경: selectbox 기본값 주입
                 if pre_val and pre_val in codes:
                     _prime_default(key, pre_val)
@@ -730,7 +856,15 @@ def _render_single_side_inputs(site: str, part_type: str) -> dict:
 def get_required_sets(udf, pair_id: str, base_side: str):
     need_base  = required_keys(udf, pair_id, base_side)
     need_extra = extra_keys_from_other_side(udf, pair_id, base_side)
-
+                                           
+    # ✅ (핵심) 룰로 자동 채워질 수 있는 상대측 key는 extra 입력 UI에서 숨김
+    try:
+        auto_keys = auto_target_keys_from_rules(udf, pair_id, base_side, ATTR_RULES)
+        if auto_keys:
+            need_extra = [k for k in need_extra if k not in auto_keys]
+    except Exception:
+        pass
+    
     if not need_base and not need_extra:
         all_keys = udf[udf["pair_id"] == pair_id]["key"].dropna().unique().tolist()
         need_base = all_keys
@@ -740,6 +874,28 @@ def get_required_sets(udf, pair_id: str, base_side: str):
     if any(k in need_base for k in nominal_family):
         need_extra = [k for k in need_extra if k not in nominal_family]
 
+    def get_required_sets(udf, pair_id: str, base_side: str):
+        need_base  = required_keys(udf, pair_id, base_side)
+        need_extra = extra_keys_from_other_side(udf, pair_id, base_side)
+    
+        if not need_base and not need_extra:
+            all_keys = udf[udf["pair_id"] == pair_id]["key"].dropna().unique().tolist()
+            need_base = all_keys
+    
+        # ★ 추가: 호칭 계열 키는 기준측에만 표시하고 상대측(extra)에서는 숨김
+        nominal_family = {"nominal", "nominalX10"}
+        if any(k in need_base for k in nominal_family):
+            need_extra = [k for k in need_extra if k not in nominal_family]
+    
+        # ✅ (핵심) 룰로 자동 채워질 수 있는 '상대측 키'는 extra 입력 UI에서 숨김
+        try:
+            auto_keys = auto_target_keys_from_rules(udf, pair_id, base_side, ATTR_RULES)
+            if auto_keys:
+                need_extra = [k for k in need_extra if k not in auto_keys]
+        except Exception:
+            # 필터 실패해도 기존 동작 유지
+            pass
+ 
     return need_base, need_extra
 
 if ok_pt == "2258":
@@ -747,6 +903,7 @@ if ok_pt == "2258":
 # ---------------------------------------------------------------------
 # 6 + 7) 좌/우 패널 렌더 + 조회/생성 (Enter 지원 위해 하나의 form으로 통합)
 # ---------------------------------------------------------------------
+st.session_state["__visible_widget_keys__"] = set()
 with st.form("main_query_form"):
 
     ik_selected, ok_selected = {}, {}
@@ -813,10 +970,21 @@ with st.form("main_query_form"):
 
     # 폼용 Submit 버튼 (Enter로도 실행됨)
     do_query = st.form_submit_button("조회")
-
+    
+    # ✅ rerun이 발생해도 '조회 의도'를 유지하기 위한 래치(latch)
+    # - submit이 눌린 run에서 __do_query__를 True로 올려둠
+    # - 이후 룰 적용 과정에서 st.rerun()이 일어나도, 다음 run에서 do_query를 True로 복원 가능
+    if do_query:
+        st.session_state["__do_query__"] = True
+    
+        # ✅ (핵심) 조회를 새로 시작할 때마다 충돌 선택값 초기화
+        st.session_state["__run_ik_overrides__"] = {}
+        st.session_state["__run_ok_overrides__"] = {}
+    
+    # 최종 do_query는 session_state latch까지 포함
+    do_query = bool(st.session_state.get("__do_query__", False))
 # ============= 폼 밖에서 조회 실행 =============
 if do_query:
-
     # --------------------------
     # IK + OK 모두 있는 경우
     # --------------------------
@@ -825,87 +993,95 @@ if do_query:
             st.error("IK/OK pair가 확정되지 않았습니다.")
             st.stop()
 
+        # ✅ 현재 저장된(사용자 확정) overrides (shared lookup 전용)
+        user_ik_over = st.session_state.get("__run_ik_overrides__", {}) or {}
+        user_ok_over = st.session_state.get("__run_ok_overrides__", {}) or {}
+
+        # ✅ shared lookup 판별용 schema map
+        smap = build_schema_maps(udf, pair_id)
+        IK_L2K = smap["IK_lookup_to_key"]
+        OK_L2K = smap["OK_lookup_to_key"]
+
+        def _is_shared_lookup_name(lk: str) -> bool:
+            ikk = IK_L2K.get(lk)
+            okk = OK_L2K.get(lk)
+            return bool(ikk) and (ikk == okk)
+
+        # 1) 입력값 수집
         attrs = {}
         attrs.update(ik_selected or {})
         attrs.update(ok_selected or {})
-
-        # ★ 호칭 자동 보완
         attrs = _auto_fill_nominal(attrs)
-        # ✅ 0) 속성간 매칭 룰 적용 (FIX/ALLOWLIST/자동매칭/충돌)
+
+        # 2) 룰 엔진 적용
+        #    - 중요: 현재까지 사용자가 확정한 overrides(user_ik_over/user_ok_over)를 "현재값"으로 같이 전달
         rule_result = apply_rules_to_attrs(
             udf=udf,
             compiled=ATTR_RULES,
             pair_id=pair_id,
-            base_side=base_side,     # "IK" 또는 "OK"
+            base_side=base_side,
             attrs_in=attrs,
+            ik_overrides_in=user_ik_over,
+            ok_overrides_in=user_ok_over,
         )
+
+        # 3) 룰이 자동으로 위젯값을 바꿔야 하면 pending → rerun
+        #    (non-shared lookup만 updates에 담김)
+        # 3) 룰이 자동으로 위젯값을 바꿔야 하면 pending → rerun
+        if rule_result.updates:
+            visible_keys = st.session_state.get("__visible_widget_keys__", set()) or set()
         
-        # 자동 세팅된 값은 다음 rerun에서 UI에도 반영되도록 session_state에 기록
-        for wk, val in rule_result.updates.items():
-            st.session_state[wk] = val
+            # ✅ (핵심) 이번 run에서 실제로 화면에 있는 위젯만 rerun 대상으로 삼는다
+            visible_updates = {k: v for k, v in rule_result.updates.items() if k in visible_keys}
+            hidden_updates  = {k: v for k, v in rule_result.updates.items() if k not in visible_keys}
         
-        # 참고 메시지 출력
+            # (1) 숨겨진 위젯 업데이트는 rerun 없이 session_state에만 반영 (루프 방지)
+            for k, v in hidden_updates.items():
+                st.session_state[k] = v
+        
+            # (2) 보이는 위젯 업데이트는 pending으로 넘기고 rerun (값이 바뀌는 경우에만)
+            changed_visible = {k: v for k, v in visible_updates.items() if str(st.session_state.get(k, "")) != str(v)}
+        
+            if changed_visible:
+                st.session_state["__pending_widget_updates__"] = dict(changed_visible)
+                st.session_state["__pending_infos__"] = list(rule_result.infos)
+                st.session_state["__pending_blockers__"] = list(rule_result.blockers)
+                st.session_state["__pending_conflicts__"] = list(rule_result.conflicts)
+        
+                # ✅ overrides 누적
+                st.session_state["__pending_ik_overrides__"] = {**user_ik_over, **dict(rule_result.ik_overrides)}
+                st.session_state["__pending_ok_overrides__"] = {**user_ok_over, **dict(rule_result.ok_overrides)}
+        
+                st.session_state["__do_query__"] = True
+                st.rerun()
+        
+            # ✅ visible 업데이트도 없고(hidden만 처리)면 rerun 안 하고 다음 단계(encode)로 진행
+
+        # 4) 정보 메시지
         for msg in rule_result.infos:
             st.info(msg)
-        
-        # 차단(에러) 있으면 조회 중단
+
+        # 5) 차단(조회 중단)
         if rule_result.blockers:
             for e in rule_result.blockers:
                 st.error(e)
             st.stop()
-        
-        # 충돌이 있으면 사용자 선택 UI 띄우고, 선택 적용 후 rerun
+
+        # 6) 충돌 발생 시: 이 run에서 UI 렌더하지 말고 "충돌 상태"만 저장하고 rerun
+        #    (중요: 충돌 UI를 do_query 밖에서 렌더해야 '선택 적용'이 정상 처리됨)
         if rule_result.conflicts:
-            st.warning("속성 자동매칭 중 충돌이 발견되었습니다. 아래에서 후보를 선택해 주세요.")
-        
-            # 룩업 라벨을 보여주기 위해 lookups 로드
-            lookups = load_lookups()
-        
-            # conflict 선택값을 저장할 임시 딕셔너리
-            chosen = {}
-        
-            for i, c in enumerate(rule_result.conflicts, start=1):
-                # side별 part_type
-                pt_for_lookup = ik_pt if c.side == "IK" else ok_pt
-                system_local = "IK" if str(pt_for_lookup).upper().startswith("V") else "OK"
-        
-                # 옵션(코드→라벨) 가져오기
-                opts = _merged_lookup_options(lookups, c.lookup, system_local, pt_for_lookup)
-        
-                # 후보 코드 리스트
-                codes = c.candidates
-        
-                # 표시 라벨
-                side_kor = "익산" if c.side == "IK" else "옥천"
-                kor_label = get_attr_label_kor(c.side, pt_for_lookup, c.key)
-        
-                # 기본값: 현재 세션 값이 후보에 있으면 그걸, 아니면 첫 후보
-                current = st.session_state.get(f"U:{pair_id}:{c.side}:{c.key}", "")
-                default = current if current in codes else codes[0]
-        
-                chosen_code = st.selectbox(
-                    f"{i}) {side_kor} / {kor_label} ({c.lookup}) — {c.reason}",
-                    codes,
-                    index=codes.index(default) if default in codes else 0,
-                    format_func=lambda code: f"{code} - {opts.get(code,'')}" if opts else code,
-                    key=f"CF:{pair_id}:{c.side}:{c.key}:{c.lookup}:{i}",
-                )
-                chosen[(c.side, c.key)] = chosen_code
-        
-            if st.button("선택 적용", type="primary"):
-                # 선택값을 실제 입력 위젯키(U:...)에 반영
-                for (side, key), code in chosen.items():
-                    wk = f"U:{pair_id}:{side}:{key}"
-                    st.session_state[wk] = code
-                st.success("선택값을 적용했습니다. 이제 '조회'를 다시 눌러 주세요.")
-                st.rerun()
-        
-            st.stop()
-        
-        # 충돌 없으면 attrs 갱신해서 아래 로직 계속 진행
+            st.session_state["__await_conflict__"] = True
+            st.session_state["__active_conflicts__"] = list(rule_result.conflicts)
+            st.session_state["__conflict_pair_id__"] = pair_id
+            st.session_state["__conflict_base_side__"] = base_side
+
+            # 조회 파이프라인은 잠시 중단
+            st.session_state["__do_query__"] = False
+            st.rerun()
+
+        # 7) (중요) 충돌이 없을 때만 코드 생성
         attrs = rule_result.attrs
 
-        # 필수 누락 체크
         miss_base  = missing_required_keys(udf, pair_id, base_side,  attrs)
         miss_other = missing_required_keys(udf, pair_id, other_side, attrs)
 
@@ -914,63 +1090,121 @@ if do_query:
             st.stop()
 
         if miss_other:
-            st.warning(
-                f"상대({other_side}) 필수 누락: {miss_other} — 이 키들까지 입력하면 완전한 11자리 생성"
-            )
+            st.warning(f"상대({other_side}) 필수 누락: {miss_other} — 이 키들까지 입력하면 완전한 11자리 생성")
+
+        # ✅ 최종 overrides = (사용자 확정 overrides) + (룰이 만든 overrides)
+        final_ik_over = {**user_ik_over, **dict(rule_result.ik_overrides)}
+        final_ok_over = {**user_ok_over, **dict(rule_result.ok_overrides)}
 
         ik_code, ok_code = encode_both(
             udf, pair_id, attrs,
-            ik_overrides=rule_result.ik_overrides,
-            ok_overrides=rule_result.ok_overrides,
+            ik_overrides=final_ik_over,
+            ok_overrides=final_ok_over,
         )
 
         if ik_code:
             st.success(f"IK 코드: `{ik_code}`")
         if ok_code:
             st.success(f"OK 코드: `{ok_code}`")
+            
+        st.session_state["__do_query__"] = False
+# ---------------------------------------------------------------------
+# ✅ 충돌 해결 UI는 do_query와 분리 (SPF_6 핵심 구조)
+# - do_query가 False여도, "선택 적용" 클릭을 반드시 처리할 수 있어야 한다.
+# ---------------------------------------------------------------------
+if (
+    st.session_state.get("__await_conflict__", False)
+    and st.session_state.get("__conflict_pair_id__") == pair_id
+    and has_both and pair_id
+):
+    conflicts = st.session_state.get("__active_conflicts__", []) or []
+    if conflicts:
+        st.warning("속성 자동매칭 중 충돌이 발견되었습니다. 아래에서 후보를 선택해 주세요.")
+        lookups = load_lookups()
 
-        # (matched_parts 보완 로직 그대로 유지)
-        # ...
+        # shared lookup 판별용 schema map
+        smap = build_schema_maps(udf, pair_id)
+        IK_L2K = smap["IK_lookup_to_key"]
+        OK_L2K = smap["OK_lookup_to_key"]
 
-    # --------------------------
-    # IK 전용 표준품
-    # --------------------------
-    elif ik_only:
-        if not ik_selected:
-            st.error("익산 속성 입력값이 없습니다.")
-            st.stop()
+        def _is_shared_lookup_name(lk: str) -> bool:
+            ikk = IK_L2K.get(lk)
+            okk = OK_L2K.get(lk)
+            return bool(ikk) and (ikk == okk)
 
-        ik_selected = _auto_fill_nominal(ik_selected)
-        ik_norm = normalize_selected_by_schema("IK", ik_pt, ik_selected)
-        ik_code = assemble_by_schema("IK", ik_pt, ik_norm)
+        # 현재 저장된(사용자 확정) overrides
+        user_ik_over = st.session_state.get("__ik_overrides__", {}) or {}
+        user_ok_over = st.session_state.get("__ok_overrides__", {}) or {}
 
-        if ik_code:
-            st.success(f"IK 코드: `{ik_code}`")
-            st.info("해당 표준품은 옥천에 등록된 대응 코드가 없습니다.")
-        else:
-            st.error("IK 코드를 생성하지 못했습니다. 입력값을 확인해 주세요.")
+        with st.form(f"conflict_form_outside::{pair_id}"):
+            form_rows = []  # (Conflict, widget_key)
 
-    # --------------------------
-    # OK 전용 표준품
-    # --------------------------
-    elif ok_only:
-        if not ok_selected:
-            st.error("옥천 속성 입력값이 없습니다.")
-            st.stop()
+            for i, c in enumerate(conflicts, start=1):
+                pt_for_lookup = ik_pt if c.side == "IK" else ok_pt
+                system_local = "IK" if str(pt_for_lookup).upper().startswith("V") else "OK"
+                opts = _merged_lookup_options(lookups, c.lookup, system_local, pt_for_lookup)
 
-        ok_selected = _auto_fill_nominal(ok_selected)
-        ok_norm = normalize_selected_by_schema("OK", ok_pt, ok_selected)
-        ok_code = assemble_by_schema("OK", ok_pt, ok_norm)
+                side_kor = "익산" if c.side == "IK" else "옥천"
+                kor_label = get_attr_label_kor(c.side, pt_for_lookup, c.key)
 
-        if ok_code:
-            st.success(f"OK 코드: `{ok_code}`")
-            st.info("해당 표준품은 익산에 등록된 대응 코드가 없습니다.")
-        else:
-            st.error("OK 코드를 생성하지 못했습니다. 입력값을 확인해 주세요.")
+                # 기본값: shared lookup이면 side별 overrides 우선, 아니면 U: 위젯값
+                cur_val = ""
+                if _is_shared_lookup_name(c.lookup):
+                    cur_val = (user_ik_over.get(c.key, "") if c.side == "IK" else user_ok_over.get(c.key, ""))
+                if not cur_val:
+                    cur_val = st.session_state.get(f"U:{pair_id}:{c.side}:{c.key}", "")
 
-    else:
-        st.error("선택된 part_type 정보가 없습니다.")
+                default = cur_val if cur_val in c.candidates else c.candidates[0]
 
+                wkey = f"CF_OUT:{pair_id}:{c.side}:{c.key}:{c.lookup}:{i}"
+                st.selectbox(
+                    f"{i}) {side_kor} / {kor_label} ({c.lookup}) — {c.reason}",
+                    c.candidates,
+                    index=c.candidates.index(default) if default in c.candidates else 0,
+                    format_func=lambda code: f"{code} - {opts.get(code,'')}" if opts else code,
+                    key=wkey,
+                )
+                form_rows.append((c, wkey))
+
+            applied = st.form_submit_button("선택 적용", type="primary")
+
+        if applied:
+            new_user_ik = dict(user_ik_over)
+            new_user_ok = dict(user_ok_over)
+
+            pending = {}
+
+            for c, wkey in form_rows:
+                chosen_code = str(st.session_state.get(wkey, "")).strip()
+
+                if _is_shared_lookup_name(c.lookup):
+                    # shared → overrides로 저장
+                    if c.side == "IK":
+                        new_user_ik[c.key] = chosen_code
+                    else:
+                        new_user_ok[c.key] = chosen_code
+                else:
+                    # non-shared → 위젯 값으로 반영
+                    pending[f"U:{pair_id}:{c.side}:{c.key}"] = chosen_code
+
+            # ✅ 저장
+            st.session_state["__run_ik_overrides__"] = new_user_ik
+            st.session_state["__run_ok_overrides__"] = new_user_ok
+
+            if pending:
+                st.session_state["__pending_widget_updates__"] = pending
+
+            # ✅ 충돌 상태 해제
+            st.session_state["__await_conflict__"] = False
+            st.session_state["__active_conflicts__"] = []
+            st.session_state["__conflict_pair_id__"] = None
+
+            # ✅ 다음 run에서 조회 파이프라인 재가동
+            st.session_state["__pending_do_query__"] = True
+            st.rerun()
+
+        # 충돌 해결 전에는 아래로 내려가지 않게 중단
+        st.stop()
 # ---------------------------------------------------------------------
 # 8) 이미지 출력 (좌=IK / 우=OK)
 # ---------------------------------------------------------------------
@@ -1122,3 +1356,7 @@ with col_r:
         render_images(part_code=ok_pt, site="OK")
     else:
         st.info("OK part_type 미선택")
+
+st.session_state["__do_query__"] = False
+
+st.caption(f"[DBG] auto_keys={sorted(list(auto_target_keys_from_rules(udf, pair_id, base_side, ATTR_RULES)))}")
