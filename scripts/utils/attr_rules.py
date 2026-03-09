@@ -5,12 +5,14 @@
 속성간 매칭 룰 엔진 (SPF)
 - data/매칭테이블.csv 를 MAP 룰 + CONSTRAINT(FIX/ALLOWLIST)로 컴파일
 - 조회(조회 버튼 클릭) 시 attrs(dict)에 룰을 적용
-- 충돌(후보 2개 이상)은 자동 결정하지 않고 conflict로 반환 → UI에서 사용자 선택
+- 충돌(후보 2개 이상)은 자동 결정하지 않고 conflicts로 반환 → UI에서 사용자 선택
+- IK/OK가 같은 key를 공유하는 lookup(예: material_lookup)이 있을 수 있으므로,
+  반대쪽 값은 attrs를 직접 덮지 않고 *_overrides로 반환하여 encode 시점에만 적용 가능하게 한다.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Set, Optional
 from collections import defaultdict
 
@@ -23,20 +25,22 @@ import pandas as pd
 @dataclass
 class Conflict:
     """사용자 선택이 필요한 충돌"""
-    side: str          # "IK" or "OK"
-    key: str           # union_schema의 key (attr_name)
-    lookup: str        # lookup table name
-    candidates: List[str]  # 후보 코드들(문자열)
-    reason: str        # 설명용
+    side: str                # "IK" or "OK"
+    key: str                 # union_schema의 key (attr_name)
+    lookup: str              # lookup table name
+    candidates: List[str]    # 후보 코드들(문자열)
+    reason: str              # 설명용
 
 
 @dataclass
 class RuleApplyResult:
     attrs: Dict[str, str]
-    updates: Dict[str, str]     # session_state에 넣을 위젯키 → 값
-    infos: List[str]            # 참고 메시지
-    blockers: List[str]         # 조회 중단 에러 메시지
-    conflicts: List[Conflict]   # 사용자 선택 필요
+    updates: Dict[str, str]             # session_state에 넣을 위젯키 → 값 (공유키가 아닌 경우만)
+    infos: List[str]                    # 참고 메시지
+    blockers: List[str]                 # 조회 중단 에러 메시지
+    conflicts: List[Conflict]           # 사용자 선택 필요
+    ik_overrides: Dict[str, str] = field(default_factory=dict)  # 공유키/반대측 세팅용
+    ok_overrides: Dict[str, str] = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,7 +67,6 @@ def load_match_table_csv(path: str = "data/매칭테이블.csv") -> pd.DataFrame
         df["옥천_코드"] = df["옥천_코드"].str.strip()
 
     df["pair_id"] = df["익산품번"] + "_" + df["옥천품번"]
-
     return df
 
 
@@ -85,8 +88,8 @@ def compile_rules(df: pd.DataFrame) -> Dict:
 
     반환 구조(핵심만):
     - maps[direction][pair_id][(trigger_lookup, trigger_code)] -> list[(target_lookup, target_code), ...]
-    - trigger_codes[direction][pair_id][trigger_lookup] -> set(codes)
-    - allowed_codes[pair_id][side][lookup] -> set(codes)          # (요구사항 5) 허용값 검증용
+    - trigger_codes[direction][pair_id][trigger_lookup] -> set(codes)   # (요구사항 5) '매칭 룰 존재' 검증용
+    - allowed_codes[pair_id][side][lookup] -> set(codes)                # (요구사항 5) 허용값 검증용(기준측만)
     - constraints[pair_id][side][lookup] -> {"type": FIX/ALLOWLIST, "codes": set(...)}
     """
     df = df.copy()
@@ -110,20 +113,22 @@ def compile_rules(df: pd.DataFrame) -> Dict:
         ok_lk = r.get("옥천속성_lookup", "").strip()
         ok_cd = r.get("옥천_코드", "").strip()
 
-        # (요구사항 5) 허용코드 집합: 테이블에 한 번이라도 등장한 코드는 '현실 허용 후보'로 간주
+        # (요구사항 5) 테이블에 등장한 코드 집합(현실 허용 후보로 간주)
         if ik_lk and ik_cd:
             allowed_codes[pair_id]["IK"][ik_lk].add(ik_cd)
         if ok_lk and ok_cd:
             allowed_codes[pair_id]["OK"][ok_lk].add(ok_cd)
 
+        # 제약/고정
         if rt == "IK_ONLY":
-            # 익산측 lookup/code가 있으면: FIX 또는 ALLOWLIST 후보 (코드 개수로 판정)
             constraints_raw[pair_id]["IK"][ik_lk].add(ik_cd)
-
-        elif rt == "OK_ONLY":
+            continue
+        if rt == "OK_ONLY":
             constraints_raw[pair_id]["OK"][ok_lk].add(ok_cd)
+            continue
 
-        elif rt == "MAP":
+        # 매칭 룰
+        if rt == "MAP":
             if direction == "익산->옥천":
                 trig = (ik_lk, ik_cd)
                 act = (ok_lk, ok_cd)
@@ -172,15 +177,13 @@ def build_schema_maps(udf: pd.DataFrame, pair_id: str) -> Dict:
             "OK_key_to_lookup": {},
         }
 
-    for c in ("lookup", "key", "dtype"):
+    for c in ("lookup", "key"):
         if c in block.columns:
             block[c] = block[c].fillna("").astype(str).str.strip()
 
     ik_l2k = {}
     ok_l2k = {}
 
-    # lookup이 있는(=lookup dtype) 속성만 대상으로
-    # required_ik / required_ok가 bool로 들어가 있는 상태를 기대
     ik_rows = block[block.get("required_ik", False) == True]
     ok_rows = block[block.get("required_ok", False) == True]
 
@@ -208,9 +211,7 @@ def build_schema_maps(udf: pd.DataFrame, pair_id: str) -> Dict:
 
 
 def widget_key(pair_id: str, side: str, key: str) -> str:
-    """
-    app.py의 _render_inputs_for_side 에서 쓰는 위젯 키 규칙과 동일하게 맞춘다.
-    """
+    """app.py의 _render_inputs_for_side 에서 쓰는 위젯 키 규칙과 동일"""
     return f"U:{pair_id}:{side}:{key}"
 
 
@@ -221,14 +222,17 @@ def apply_rules_to_attrs(
     udf: pd.DataFrame,
     compiled: Dict,
     pair_id: str,
-    base_side: str,         # "IK" or "OK"
-    attrs_in: Dict[str, str]
+    base_side: str,
+    attrs_in: Dict[str, str],
+    ik_overrides_in: Optional[Dict[str, str]] = None,
+    ok_overrides_in: Optional[Dict[str, str]] = None,
 ) -> RuleApplyResult:
     """
     조회 시점에 attrs에 룰 적용.
-    - FIX 먼저 반영(강제)
-    - (요구사항 5) 허용목록 위반이면 blockers에 추가
-    - MAP 룰로 other_side 속성 자동 세팅
+    - FIX 먼저 반영(강제)  ※ 기준측만
+    - ALLOWLIST 위반/매칭테이블 미정의 코드/매칭 없음은 blockers로 조회 중단  ※ 기준측만
+    - MAP 룰로 반대측 값 제안/자동설정
+      * IK/OK가 같은 key를 공유하는 lookup이면 attrs를 덮지 않고 overrides로만 반환
     - 충돌이면 conflicts로 반환(사용자 선택 필요)
     """
     base_side = base_side.upper()
@@ -237,64 +241,75 @@ def apply_rules_to_attrs(
 
     attrs = {k: ("" if v is None else str(v).strip()) for k, v in (attrs_in or {}).items()}
 
+    ik_overrides_in = {k: str(v).strip() for k, v in (ik_overrides_in or {}).items()}
+    ok_overrides_in = {k: str(v).strip() for k, v in (ok_overrides_in or {}).items()}
+
     schema_maps = build_schema_maps(udf, pair_id)
     IK_L2K = schema_maps["IK_lookup_to_key"]
     OK_L2K = schema_maps["OK_lookup_to_key"]
-    IK_K2L = schema_maps["IK_key_to_lookup"]
-    OK_K2L = schema_maps["OK_key_to_lookup"]
 
     def l2k(side: str, lookup: str) -> Optional[str]:
         return IK_L2K.get(lookup) if side == "IK" else OK_L2K.get(lookup)
 
-    def k2l(side: str, key: str) -> Optional[str]:
-        return IK_K2L.get(key) if side == "IK" else OK_K2L.get(key)
+    def is_shared_lookup(lookup_name: str) -> bool:
+        """IK/OK가 같은 key를 공유하는 lookup인지"""
+        ik_key = IK_L2K.get(lookup_name)
+        ok_key = OK_L2K.get(lookup_name)
+        return bool(ik_key) and (ik_key == ok_key)
 
     infos: List[str] = []
     blockers: List[str] = []
     conflicts: List[Conflict] = []
     updates: Dict[str, str] = {}
 
-    # ── 1) 제약(FIX/ALLOWLIST) 적용/검증
+    ik_overrides: Dict[str, str] = {}
+    ok_overrides: Dict[str, str] = {}
+
+    # ── 1) 제약(FIX/ALLOWLIST) 적용/검증 (기준측만)
     constraints = compiled["constraints"].get(pair_id, {"IK": {}, "OK": {}})
 
-    for side in ("IK", "OK"):
-        for lk, obj in constraints.get(side, {}).items():
-            key = l2k(side, lk)
-            if not key:
-                continue
+    for lk, obj in constraints.get(base_side, {}).items():
+        key = l2k(base_side, lk)
+        if not key:
+            continue
 
-            ctype = obj["type"]
-            codes = sorted(list(obj["codes"]))
+        ctype = obj["type"]
+        codes = sorted(list(obj["codes"]))
+        cur = attrs.get(key, "").strip()
 
-            cur = attrs.get(key, "").strip()
-
-            if ctype == "FIX":
-                fixed = codes[0]
-                if cur != fixed:
+        if ctype == "FIX":
+            fixed = codes[0]
+            if cur != fixed:
+                # 기준측이더라도 shared key인 경우는 attrs를 덮으면 반대측도 오염되니 overrides로 처리
+                if is_shared_lookup(lk):
+                    if base_side == "IK":
+                        ik_overrides[key] = fixed
+                    else:
+                        ok_overrides[key] = fixed
+                    infos.append(f"[고정] {base_side}:{lk} 는 '{fixed}'로 고정(override)되었습니다.")
+                else:
                     attrs[key] = fixed
-                    updates[widget_key(pair_id, side, key)] = fixed
-                    infos.append(f"[고정] {side}:{lk} 는 '{fixed}'로 고정되어 자동 설정되었습니다.")
-            else:
-                # ALLOWLIST: 사용자가 입력한 값이 허용목록 밖이면 차단
-                if cur and cur not in obj["codes"]:
-                    blockers.append(f"[허용값 위반] {side}:{lk} 에 '{cur}'를 입력했지만 허용값은 {codes} 입니다.")
+                    updates[widget_key(pair_id, base_side, key)] = fixed
+                    infos.append(f"[고정] {base_side}:{lk} 는 '{fixed}'로 고정되어 자동 설정되었습니다.")
+        else:
+            if cur and cur not in obj["codes"]:
+                blockers.append(f"[허용값 위반] {base_side}:{lk} 에 '{cur}'를 입력했지만 허용값은 {codes} 입니다.")
 
-    # ── 2) (요구사항 5) 테이블 기반 허용코드 검증
+    # ── 2) (요구사항 5) 테이블 기반 허용코드 검증 (기준측만)
     allowed = compiled["allowed_codes"].get(pair_id, {"IK": {}, "OK": {}})
 
-    for side in ("IK", "OK"):
-        for lk, allowed_set in allowed.get(side, {}).items():
-            key = l2k(side, lk)
-            if not key:
-                continue
-            cur = attrs.get(key, "").strip()
-            if cur and cur not in allowed_set:
-                blockers.append(
-                    f"[매칭테이블 미정의 코드] {side}:{lk} 의 '{cur}'는 매칭테이블에 정의된 코드가 아닙니다. "
-                    f"(허용: {sorted(list(allowed_set))})"
-                )
+    for lk, allowed_set in allowed.get(base_side, {}).items():
+        key = l2k(base_side, lk)
+        if not key:
+            continue
+        cur = attrs.get(key, "").strip()
+        if cur and cur not in allowed_set:
+            blockers.append(
+                f"[매칭테이블 미정의 코드] {base_side}:{lk} 의 '{cur}'는 매칭테이블에 정의된 코드가 아닙니다. "
+                f"(허용: {sorted(list(allowed_set))})"
+            )
 
-    # ── 3) 방향 기준 트리거 값이 "매칭 룰에 존재하는지" 검증 (없으면 '매칭되는게 없다')
+    # ── 3) 기준측 트리거 값이 '매칭 룰에 존재'하는지 검증 (기준측만)
     trig_side = base_side
     trig_codes_map = compiled["trigger_codes"][direction].get(pair_id, defaultdict(set))
 
@@ -310,12 +325,15 @@ def apply_rules_to_attrs(
             )
 
     if blockers:
-        return RuleApplyResult(attrs=attrs, updates=updates, infos=infos, blockers=blockers, conflicts=[])
+        return RuleApplyResult(
+            attrs=attrs, updates=updates, infos=infos, blockers=blockers, conflicts=[],
+            ik_overrides=ik_overrides, ok_overrides=ok_overrides
+        )
 
-    # ── 4) MAP 룰 적용(자동 세팅 후보 수집)
+    # ── 4) MAP 룰 적용(반대측 값 제안 수집)
     maps = compiled["maps"][direction].get(pair_id, {})
     proposals: Dict[Tuple[str, str, str], Set[str]] = defaultdict(set)
-    # proposals key: (side, key, lookup) -> set(codes)
+    # proposals key: (target_side, target_key, target_lookup) -> set(codes)
 
     for (trig_lk, trig_cd), actions in maps.items():
         trig_key = l2k(trig_side, trig_lk)
@@ -325,7 +343,6 @@ def apply_rules_to_attrs(
         if cur != trig_cd:
             continue
 
-        # 트리거 성립 → 액션 제안
         for (tgt_lk, tgt_cd) in actions:
             tgt_side = other_side
             tgt_key = l2k(tgt_side, tgt_lk)
@@ -333,41 +350,83 @@ def apply_rules_to_attrs(
                 continue
             proposals[(tgt_side, tgt_key, tgt_lk)].add(str(tgt_cd).strip())
 
-    # ── 5) 제안값 반영 / 충돌은 분리
+    # ── 5) 제안값 반영 / 충돌 분리
     for (tgt_side, tgt_key, tgt_lk), cand_set in proposals.items():
         cand = sorted([c for c in cand_set if c != ""])
         if not cand:
             continue
-
-        cur = attrs.get(tgt_key, "").strip()
+        
+        # ✅ 현재값(cur) 계산: shared lookup이면 "side별 override"를 현재값으로 인정해야 함
+        if is_shared_lookup(tgt_lk) and (tgt_side != base_side):
+            # 반대측의 현재값은 attrs가 아니라 overrides_in에서 읽는다
+            cur = (ik_overrides_in.get(tgt_key, "") if tgt_side == "IK" else ok_overrides_in.get(tgt_key, "")).strip()
+        else:
+            cur = attrs.get(tgt_key, "").strip()
 
         if len(cand) == 1:
             only = cand[0]
+
+            # 기존값이 비어있으면 자동 적용
             if cur == "":
-                attrs[tgt_key] = only
-                updates[widget_key(pair_id, tgt_side, tgt_key)] = only
-                infos.append(f"[자동매칭] {tgt_side}:{tgt_lk} = '{only}' 로 자동 설정되었습니다.")
+                if is_shared_lookup(tgt_lk):
+                    if tgt_side == "IK":
+                        ik_overrides[tgt_key] = only
+                        infos.append(f"[자동매칭] IK:{tgt_lk} = '{only}' (override)로 설정되었습니다.")
+                    else:
+                        ok_overrides[tgt_key] = only
+                        infos.append(f"[자동매칭] OK:{tgt_lk} = '{only}' (override)로 설정되었습니다.")
+                else:
+                    attrs[tgt_key] = only
+                    updates[widget_key(pair_id, tgt_side, tgt_key)] = only
+                    infos.append(f"[자동매칭] {tgt_side}:{tgt_lk} = '{only}' 로 자동 설정되었습니다.")
+
+            # 기존값이 있는데 다르면 충돌(사용자 선택)
             elif cur != only:
-                # 사용자 입력/기존값과 충돌 → 선택 필요
-                cands = sorted(set([cur, only]))
                 conflicts.append(
                     Conflict(
-                        side=tgt_side, key=tgt_key, lookup=tgt_lk,
-                        candidates=cands,
+                        side=tgt_side,
+                        key=tgt_key,
+                        lookup=tgt_lk,
+                        candidates=sorted(set([cur, only])),
                         reason=f"기존값 '{cur}' vs 자동매칭 '{only}' 충돌"
                     )
                 )
-        else:
-            # 후보 2개 이상 → 선택 필요 (현재값도 후보에 포함)
-            cands = set(cand)
-            if cur:
-                cands.add(cur)
-            conflicts.append(
-                Conflict(
-                    side=tgt_side, key=tgt_key, lookup=tgt_lk,
-                    candidates=sorted(cands),
-                    reason="자동매칭 후보가 2개 이상"
-                )
-            )
 
-    return RuleApplyResult(attrs=attrs, updates=updates, infos=infos, blockers=[], conflicts=conflicts)
+        else:
+            # 후보가 2개 이상인 경우:
+            # - 사용자가 이미 후보 중 하나를 선택해서 cur에 들어있으면 "해결"로 간주하고 conflicts로 보내지 않음
+            # - 아직 cur이 비어있거나 후보에 없는 값이면 conflicts로 보냄
+            if cur and cur in cand:
+                # ✅ 사용자가 이미 후보 중 하나를 선택한 상태 → 충돌 해결 처리
+                if is_shared_lookup(tgt_lk):
+                    # shared lookup이면 attrs를 덮지 않고 override로만 확정
+                    if tgt_side == "IK":
+                        ik_overrides[tgt_key] = cur
+                    else:
+                        ok_overrides[tgt_key] = cur
+                    infos.append(f"[속성선택] {tgt_side}:{tgt_lk} = '{cur}' (사용자 선택값, override)로 선택되었습니다.")
+                else:
+                    # shared가 아니면 attrs에 유지(이미 cur이 들어있음)
+                    attrs[tgt_key] = cur
+                    infos.append(f"[속성선택] {tgt_side}:{tgt_lk} = '{cur}' (사용자 선택값)으로 선택되었습니다.")
+            else:
+                # ✅ 아직 확정값이 없으면 충돌 UI로
+                conflicts.append(
+                    Conflict(
+                        side=tgt_side,
+                        key=tgt_key,
+                        lookup=tgt_lk,
+                        candidates=cand,
+                        reason="자동매칭 후보가 2개 이상"
+                    )
+                )
+
+    return RuleApplyResult(
+        attrs=attrs,
+        updates=updates,
+        infos=infos,
+        blockers=[],
+        conflicts=conflicts,
+        ik_overrides=ik_overrides,
+        ok_overrides=ok_overrides
+    )
